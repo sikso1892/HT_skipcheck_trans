@@ -1,17 +1,24 @@
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from typing import Optional
-from build_prompt import build_skipcheck_prompt, build_trans_prompt
+import asyncio
 import os
-from time import time
-import openai
+import random
 import sys
 from datetime import datetime
-import random
-import time as _t
+from pathlib import Path
+from time import time
+from typing import Optional
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+import numpy as np
+import pandas as pd
+from openai import AsyncOpenAI
+from tqdm import tqdm
+
+from build_prompt import build_skipcheck_prompt, build_trans_prompt
+
+async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+ASYNC_CONCURRENCY=os.getenv("ASYNC_CONCURRENCY", "5")
+LOG_SEPARATOR = "-" * 107
+NEEDS_TRANSLATION_KEYWORDS = ("noneApply", "typos", "nonsensical", "multiLang")
 
 
 def _looks_like_html(s: str) -> bool:
@@ -21,18 +28,25 @@ def _looks_like_html(s: str) -> bool:
     return head.startswith("<!doctype html") or head.startswith("<html")
 
 
-def safe_chat(messages, model, max_attempts=6, base_sleep=1.0, timeout=60):
+async def safe_chat(messages, model, max_attempts=6, base_sleep=1.0, timeout=60):
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = openai.ChatCompletion.create(
+            resp = await async_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 timeout=timeout,
             )
-            choices = resp.get("choices") or []
-            if not choices or "message" not in choices[0]:
+            choices = resp.choices or []
+            if not choices or hasattr(choices[0], "message") is False:
                 raise ValueError("malformed response")
-            content = choices[0]["message"].get("content", "")
+            content = choices[0].message.content
+            if isinstance(content, list):
+                content = "".join(
+                    getattr(part, "text", "")
+                    if hasattr(part, "text")
+                    else part.get("text", "") if isinstance(part, dict) else ""
+                    for part in content
+                )
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("empty content")
             return content.strip()
@@ -49,7 +63,7 @@ def safe_chat(messages, model, max_attempts=6, base_sleep=1.0, timeout=60):
                 sleep_s = min(base_sleep * (2 ** (attempt - 1)), 30.0) + random.uniform(
                     0, 0.5
                 )
-                _t.sleep(sleep_s)
+                await asyncio.sleep(sleep_s)
                 continue
 
             if attempt == max_attempts:
@@ -57,17 +71,17 @@ def safe_chat(messages, model, max_attempts=6, base_sleep=1.0, timeout=60):
             sleep_s = min(base_sleep * (2 ** (attempt - 1)), 30.0) + random.uniform(
                 0, 0.5
             )
-            _t.sleep(sleep_s)
+            await asyncio.sleep(sleep_s)
             continue
 
 
-def skipcheck_gpt(sys, user) -> str:
-    out = safe_chat([sys, user], model="gpt-5", max_attempts=6, timeout=60)
+async def skipcheck_gpt(sys, user) -> str:
+    out = await safe_chat([sys, user], model="gpt-5.1", max_attempts=6, timeout=60)
     return out if out is not None else "__ERROR__"
 
 
-def trans_gpt(sys, user) -> str:
-    out = safe_chat([sys, user], model="gpt-5-mini", max_attempts=6, timeout=60)
+async def trans_gpt(sys, user) -> str:
+    out = await safe_chat([sys, user], model="gpt-5-mini", max_attempts=6, timeout=60)
     return out if out is not None else "__ERROR__"
 
 
@@ -102,9 +116,95 @@ class Tee:
         self.file.close()
 
 
-def process_excel(
+async def _process_row(idx: int, df_all: pd.DataFrame, is_double: bool) -> dict:
+    logs: list[str] = []
+    updates: dict[str, str] = {}
+
+    src_lang = df_all.at[idx, "Src language"]
+    origin_text = df_all.at[idx, "Origin"]
+
+    sys_prompt, user_prompt = build_skipcheck_prompt(src_lang, origin_text)
+    start = time()
+    resp1 = await skipcheck_gpt(sys_prompt, user_prompt)
+    elapsed = time() - start
+
+    if resp1 == "__ERROR__":
+        logs.append(f"row {idx}: skipcheck_gpt failed; Origin: {origin_text}")
+        return {"idx": idx, "success": False, "updates": updates, "logs": logs}
+
+    updates["Check boxes"] = resp1
+    logs.append(
+        f"row {idx}: Origin: {origin_text}, Check boxes={resp1}, 처리시간={elapsed:.2f}초"
+    )
+
+    check_val = resp1 if isinstance(resp1, str) else str(resp1)
+    needs_translation = any(kw in check_val for kw in NEEDS_TRANSLATION_KEYWORDS)
+
+    if not needs_translation:
+        return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+    if not is_double:
+        tgt_lang = df_all.at[idx, "Tgt language"]
+        sys_prompt_tr, user_prompt_tr = build_trans_prompt(tgt_lang, origin_text)
+        tr_start = time()
+        resp2 = await trans_gpt(sys_prompt_tr, user_prompt_tr)
+        tr_elapsed = time() - tr_start
+
+        if resp2 == "__ERROR__":
+            logs.append(
+                f"row {idx}: trans_gpt failed; Origin: {origin_text}, Check boxes={check_val}"
+            )
+            return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+        updates["Translation"] = resp2
+        logs.append(
+            f"row {idx}: Origin: {origin_text}, Check boxes={check_val}, "
+            f"Translation={resp2}, 처리시간={tr_elapsed:.2f}초"
+        )
+        logs.append(LOG_SEPARATOR)
+        return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+    sys_prompt1, user_prompt1 = build_trans_prompt("en_US", origin_text)
+    tr1_start = time()
+    resp_tr1 = await trans_gpt(sys_prompt1, user_prompt1)
+    tr1_elapsed = time() - tr1_start
+
+    if resp_tr1 == "__ERROR__":
+        logs.append(
+            f"row {idx}: trans_gpt(en_US) failed; Origin: {origin_text}, "
+            f"Check boxes={check_val}"
+        )
+        return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+    updates["Translation1"] = resp_tr1
+
+    sys_prompt2, user_prompt2 = build_trans_prompt("en_GB", origin_text)
+    tr2_start = time()
+    resp_tr2 = await trans_gpt(sys_prompt2, user_prompt2)
+    tr2_elapsed = time() - tr2_start
+
+    if resp_tr2 == "__ERROR__":
+        logs.append(
+            f"row {idx}: trans_gpt(en_GB) failed; Origin: {origin_text}, "
+            f"Check boxes={check_val}, Translation1(en_US)={resp_tr1}"
+        )
+        return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+    updates["Translation2"] = resp_tr2
+    logs.append(
+        f"row {idx}: Origin: {origin_text}, Check boxes={check_val}, "
+        f"Translation1(en_US)={resp_tr1}, Translation2(en_GB)={resp_tr2}, "
+        f"처리시간1={tr1_elapsed:.2f}초, 처리시간2={tr2_elapsed:.2f}초"
+    )
+    logs.append(LOG_SEPARATOR)
+
+    return {"idx": idx, "success": True, "updates": updates, "logs": logs}
+
+
+async def process_excel(
     input_excel_path: str,
     output_excel_path: str,
+    concurrency: int = 5,
 ):
     log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     log_path = Path(output_excel_path).parent / log_filename
@@ -175,102 +275,35 @@ def process_excel(
         success_cnt = 0
         base_stem, ext = output_path.stem, output_path.suffix
         out_dir = output_path.parent
+        if target_indices:
+            concurrency = max(1, concurrency)
+            semaphore = asyncio.Semaphore(concurrency)
 
-        for idx in target_indices:
-            src_lang = df_all.at[idx, "Src language"]
-            origin_text = df_all.at[idx, "Origin"]
+            async def worker(idx: int) -> dict:
+                async with semaphore:
+                    return await _process_row(idx, df_all, is_double)
 
-            sys_prompt, user_prompt = build_skipcheck_prompt(src_lang, origin_text)
-            s = time()
-            resp1 = skipcheck_gpt(sys_prompt, user_prompt)
-            e = time()
+            tasks = [asyncio.create_task(worker(idx)) for idx in target_indices]
+            with tqdm(total=len(tasks)) as progress:
+                for coro in asyncio.as_completed(tasks):
+                    result = await coro
+                    progress.update(1)
+                    idx = result["idx"]
 
-            if resp1 == "__ERROR__":
-                print(f"row {idx}: skipcheck_gpt failed; Origin: {origin_text}")
-                continue
+                    for column, value in result["updates"].items():
+                        df_all.at[idx, column] = value
 
-            df_all.at[idx, "Check boxes"] = resp1
-            success_cnt += 1
-            print(
-                f"row {idx}: Origin: {origin_text}, "
-                f"Check boxes={resp1}, 처리시간={e - s:.2f}초"
-            )
+                    for line in result["logs"]:
+                        print(line)
 
-            if success_cnt % 30 == 0:
-                chk_path = out_dir / f"{base_stem}_chk{success_cnt}{ext}"
-                df_all.to_excel(chk_path, index=False)
-                print(f"[checkpoint] saved: {chk_path}")
-
-            check_val = resp1 if isinstance(resp1, str) else str(resp1)
-            needs_translation = any(
-                kw in check_val for kw in ["noneApply", "typos", "nonsensical", "multiLang"]
-            )
-            if not needs_translation:
-                continue
-            if not is_double:
-                tgt_lang = df_all.at[idx, "Tgt language"]
-                sys_prompt_tr, user_prompt_tr = build_trans_prompt(tgt_lang, origin_text)
-                ss = time()
-                resp2 = trans_gpt(sys_prompt_tr, user_prompt_tr)
-                ee = time()
-
-                if resp2 == "__ERROR__":
-                    print(
-                        f"row {idx}: trans_gpt failed; "
-                        f"Origin: {origin_text}, Check boxes={check_val}"
-                    )
-                    continue
-
-                df_all.at[idx, "Translation"] = resp2
-                print(
-                    f"row {idx}: Origin: {origin_text}, "
-                    f"Check boxes={check_val}, Translation={resp2}, "
-                    f"처리시간={ee - ss:.2f}초"
-                )
-                print(
-                    "-----------------------------------------------------------------------------------------------------------"
-                )
-
-            else:
-                sys_prompt1, user_prompt1 = build_trans_prompt("en_US", origin_text)
-                ss1 = time()
-                resp_tr1 = trans_gpt(sys_prompt1, user_prompt1)
-                ee1 = time()
-
-                if resp_tr1 == "__ERROR__":
-                    print(
-                        f"row {idx}: trans_gpt(en_US) failed; "
-                        f"Origin: {origin_text}, Check boxes={check_val}"
-                    )
-                    continue
-
-                df_all.at[idx, "Translation1"] = resp_tr1
-
-                sys_prompt2, user_prompt2 = build_trans_prompt("en_GB", origin_text)
-                ss2 = time()
-                resp_tr2 = trans_gpt(sys_prompt2, user_prompt2)
-                ee2 = time()
-
-                if resp_tr2 == "__ERROR__":  
-                    print(
-                        f"row {idx}: trans_gpt(en_GB) failed; "
-                        f"Origin: {origin_text}, Check boxes={check_val}, "
-                        f"Translation1(en_US)={resp_tr1}"
-                    )
-                    continue
-
-                df_all.at[idx, "Translation2"] = resp_tr2
-
-                print(
-                    f"row {idx}: Origin: {origin_text}, "
-                    f"Check boxes={check_val}, "
-                    f"Translation1(en_US)={resp_tr1}, "
-                    f"Translation2(en_GB)={resp_tr2}, "
-                    f"처리시간1={ee1 - ss1:.2f}초, 처리시간2={ee2 - ss2:.2f}초"
-                )
-                print(
-                    "-----------------------------------------------------------------------------------------------------------"
-                )
+                    if result["success"]:
+                        success_cnt += 1
+                        if success_cnt % 30 == 0:
+                            chk_path = out_dir / f"{base_stem}_chk{success_cnt}{ext}"
+                            df_all.to_excel(chk_path, index=False)
+                            print(f"[checkpoint] saved: {chk_path}")
+        else:
+            print("No rows require processing.")
 
         df_all.to_excel(output_path, index=False)
         print(f"[final] saved: {output_path}")
@@ -281,7 +314,7 @@ def process_excel(
 
 
 if __name__ == "__main__":
-    INPUT_PATH = "/mnt/c/Users/Flitto/Documents/NAC/HT/data/HT test_NAC_5169_ja_JP-en_US_HT_34815_251112_120835_LLM 요청 파일.xlsx"
-    OUTPUT_PATH = "/mnt/c/Users/Flitto/Documents/NAC/HT/data/test_NAC_5169_ja_JP-en_US_HT_34815_251112_120835_LLM 요청 파일.xlsx"
+    INPUT_PATH = "data/NAC_10_samples.xlsx"
+    OUTPUT_PATH = "data/results/NAC_10_samples_results.xlsx"
     
-    process_excel(input_excel_path=INPUT_PATH, output_excel_path=OUTPUT_PATH)
+    asyncio.run(process_excel(input_excel_path=INPUT_PATH, output_excel_path=OUTPUT_PATH))

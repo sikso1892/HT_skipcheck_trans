@@ -1,5 +1,6 @@
-data/251030
-
-data/251113
-
 .env
+
+data/*
+experimets/*
+
+__pycache__
