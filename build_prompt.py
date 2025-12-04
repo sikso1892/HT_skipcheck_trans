@@ -73,14 +73,14 @@ def build_skipcheck_prompt(src_lang: str, text: str):
         - noneApply  
         - garbled  
         - wrongLang
-        """
+        """,
     }
 
     user_msg = {
         "role": "user",
         "content": f"""
         src_lang: {src_lang}\n
-        text: {text}\n"""
+        text: {text}\n""",
     }
 
     return system_msg, user_msg
@@ -89,7 +89,8 @@ def build_skipcheck_prompt(src_lang: str, text: str):
 def build_trans_prompt(target_lang: str, text: str):
     system_msg = {
         "role": "system",
-        "content": (f"""
+        "content": (
+            f"""
                     [Role]
                     You are an expert translator specialized in translating texts into {target_lang}, collected from various sources such as text messages, essays, online documents, news articles, transcribed speech data, and online comments.
                     
@@ -133,16 +134,10 @@ def build_trans_prompt(target_lang: str, text: str):
                     - The translation must be accurate, literal, and natural only within the boundaries of the original text.  
                     - Never generate or supplement content that does not exist in the source.  
                     - The translation must sound natural and idiomatic in the target language without adding or imagining information."""
-
-        )
+        ),
     }
     user_msg = {
         "role": "user",
-        "content": (
-            f"text: {text}\n"
-            f"target_lang: {target_lang}\n"
-        )
+        "content": (f"text: {text}\ntarget_lang: {target_lang}\n"),
     }
     return system_msg, user_msg
-
-

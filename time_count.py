@@ -1,5 +1,6 @@
 import re
 
+
 def sum_processing_time(log_path: str) -> float:
     total = 0.0
 

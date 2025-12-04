@@ -20,7 +20,7 @@ dotenv.load_dotenv()
 
 async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-ASYNC_CONCURRENCY=os.getenv("ASYNC_CONCURRENCY", "5")
+ASYNC_CONCURRENCY = os.getenv("ASYNC_CONCURRENCY", "5")
 LOG_SEPARATOR = "-" * 107
 NEEDS_TRANSLATION_KEYWORDS = ("noneApply", "typos", "nonsensical", "multiLang")
 
@@ -51,7 +51,9 @@ async def safe_chat(messages, model, max_attempts=6, base_sleep=1.0, timeout=60)
                 content = "".join(
                     getattr(part, "text", "")
                     if hasattr(part, "text")
-                    else part.get("text", "") if isinstance(part, dict) else ""
+                    else part.get("text", "")
+                    if isinstance(part, dict)
+                    else ""
                     for part in content
                 )
             if not isinstance(content, str) or not content.strip():
@@ -323,9 +325,11 @@ async def process_excel(
 if __name__ == "__main__":
     INPUT_PATH = "data/NAC_500_samples.xlsx"
     OUTPUT_PATH = "data/results/NAC_500_samples_results.xlsx"
-    
+
     print(
         f"Computing with ASYNC_CONCURRENCY: {ASYNC_CONCURRENCY}",
     )
-    
-    asyncio.run(process_excel(input_excel_path=INPUT_PATH, output_excel_path=OUTPUT_PATH))
+
+    asyncio.run(
+        process_excel(input_excel_path=INPUT_PATH, output_excel_path=OUTPUT_PATH)
+    )
